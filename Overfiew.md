@@ -1,5 +1,4 @@
 # CANopenMonitor
-# CANopen Monitor
 
 CANopen Monitor is a Linux-based monitoring and diagnostic tool designed for CANopen networks. It provides terminal user interface for analyzing CANopen communication. It works by connecting a CANable V2.0, probably works with other CAN-to-USB-converter too but not tested.
 
