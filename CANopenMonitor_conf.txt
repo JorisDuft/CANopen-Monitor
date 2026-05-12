@@ -1,0 +1,43 @@
+/*--------------------------------------------------------------*
+ * This is the Configuration File for the CANopen-Monitor Sw    *
+ *  -timeouts / enables: only change numbers behind = ;         *
+ *  -filter : only change numbers and Letters in = [];          *
+ *--------------------------------------------------------------*/
+
+
+/*--------------------------------------------------------------*
+ * Maximum timeout between periodic heartbeats in milliseconds  *
+ * before the node is considered inactive                       *
+ *--------------------------------------------------------------*/
+timeout_heartbeat_ms = 1000;
+
+
+/*--------------------------------------------------------------*
+ * Time a node remains in the list after becoming inactive      *
+ * After this period, it is removed from the node list          *
+ *--------------------------------------------------------------*/
+timeout_remove_ms = 10000;
+
+
+/*--------------------------------------------------------------*
+ * configuration to activeate and deactivate Logging            *
+ * 1 = log enabled   /   0 = log disabled                       *
+ *--------------------------------------------------------------*/
+log_enable = 1;
+
+/*--------------------------------------------------------------*
+ * Node-ID-Filter a list of Hex values (01 - 7F) = ID: 1 - 127  *
+ * for no filtering / all Nodes: FF                             *
+ * example (nodes: all IDs)     -> nodeid_filter = [FF];        *
+ * example (nodes: 5, 10, 15)   -> nodeid_filter = [5, A, F];   *
+ *--------------------------------------------------------------*/
+nodeid_filter = [FF];
+
+
+/*--------------------------------------------------------------*
+ * communication object filter list (sdo, pdo, nmt)             *
+ * for all communication objects: all                           *
+ * example (COB: all COB)       -> object_filter = [all];       *
+ * example (COB: sdo, pdo)      -> object_filter = [sdo, pdo]   *                                         *
+ *--------------------------------------------------------------*/
+object_filter = [all];                  //[all] -> All Comuniaction objectsy
