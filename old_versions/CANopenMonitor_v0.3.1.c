@@ -87,7 +87,7 @@ void format_time(char* out, size_t size, uint64_t t_ms)
 
     time_t sec = t_ms / 1000;
     struct tm *tm_info = localtime(&sec);
-
+    tm_info->tm_hour = tm_info->tm_hour + 2;
     strftime(out, size, "%H:%M:%S", tm_info);
 }
 
@@ -265,6 +265,26 @@ void parse_object_filter(thread_args_t* cfg, char* value)
     if (strcasestr(value, "nmt")) cfg->object_mask |= OBJ_NMT;
 }
 
+void bytes_to_hex(char *raw_data, const uint8_t *data, uint8_t len)
+{
+    static const char hex[] = "0123456789ABCDEF";
+
+    char *ptr = raw_data;
+
+    for (uint8_t i = 0; i < len; i++)
+    {
+        uint8_t b = data[i];
+
+        *ptr++ = hex[b >> 4];
+        *ptr++ = hex[b & 0x0F];
+
+        if (i < len - 1)
+            *ptr++ = ' ';
+    }
+
+    *ptr = '\0';
+}
+
 /*-------------------------------------------------------------------------------
  * Function: load_config
  * ------------------------------------------------------------------------------
@@ -298,7 +318,7 @@ void load_config(thread_args_t* gui_args)
                 if (tmp > 1)
                     gui_args->remove_timeout_ms = (time_t)tmp;
             }
-            else if (strcmp(key, "nodeID_filter") == 0)
+            else if (strcmp(key, "nodeid_filter") == 0)
             {
                 parse_node_filter(gui_args, value);
             }
@@ -365,7 +385,8 @@ void* thread_CANopenMonitor(void* arg)
         char filename[128];
         time_t time_now = time(NULL);
         struct tm *t = localtime(&time_now);
-
+        t->tm_hour = t->tm_hour + 2; // Adjust for timezone
+        
         strftime(filename, sizeof(filename),
             "CANopen_log_%Y-%m-%d_%H-%M-%S.txt", t);
 
@@ -424,7 +445,7 @@ void* thread_CANopenMonitor(void* arg)
             for (int i = 0; i < msg.len; i++)
                 msg.data[i] = frame.data[i];
 
-            if (msg.cob == 0xE)
+            if (cob_id >= 0x700 && cob_id <= 0x77F) //msg.cob == 0xE)
             {
                 node_list[msg.id].visible = true;
                 node_list[msg.id].active = true;
@@ -435,28 +456,19 @@ void* thread_CANopenMonitor(void* arg)
                 {
                     char time_str[16];
                     format_time(time_str, sizeof(time_str), msg.timestamp);
-                    fprintf(logfile, "Node %d: %02X | %s\n", msg.id, msg.data[0], time_str);
+                    fprintf(logfile, "Node %d: HB: %02X | %s\n", msg.id, msg.data[0], time_str);
                 }
             }
-            else if (msg.cob == 0x1)
+            else if (cob_id >= 0x080 && cob_id <= 0x0FF)   //msg.cob == 0x1)
             {
                 char em_msg[256];
                 char time_str[16];
                 char raw_data[64];
-                #if (CAN_MSG_LEN_FIXED)
-                snprintf(raw_data, sizeof(raw_data),
-                    "%02X %02X %02X %02X %02X %02X %02X %02X",
-                    msg.data[0], msg.data[1], msg.data[2], msg.data[3],
-                    msg.data[4], msg.data[5], msg.data[6], msg.data[7]);
-                #else
-                for (int i = 0; i < msg.len; i++)
-                {
-                    msg.data[i] = frame.data[i];
-                }
-                #endif
+
 
                 format_time(time_str, sizeof(time_str), msg.timestamp);
-                
+
+                bytes_to_hex(raw_data, msg.data, msg.len);
                 uint16_t error_code = ((uint16_t)msg.data[1] << 8) | msg.data[0];
                 const char* error_desc = get_emergencyErrorDescription(error_code);
 
@@ -466,7 +478,7 @@ void* thread_CANopenMonitor(void* arg)
                 node_list[msg.id].time_lastError = msg.timestamp;
 
                 snprintf(em_msg, sizeof(em_msg),
-                        "Node %d: %-35.35s | %s | %s",
+                        "Node %d: EMCY: %-35.35s | %s | %s",
                         msg.id,
                         error_desc,
                         raw_data,
@@ -476,49 +488,36 @@ void* thread_CANopenMonitor(void* arg)
                 updated = true;
                 if(node_log_enabled)
                 {
-                    fprintf(logfile, "Node %d: %s | %s\n", msg.id, raw_data, time_str);
+                    fprintf(logfile, "Node %d: EMCY: %s | %s\n", msg.id, raw_data, time_str);
                 }
             }
-            else if (msg.cob == 0xB)
+            else if (cob_id >= 0x580 && cob_id <= 0x5FF &&msg.data[0] == 0x80)
             {
-                if (msg.data[0] == 0x80)
+                char time_str[16];
+                char raw_data[64];
+
+                bytes_to_hex(raw_data, msg.data, msg.len);
+                uint32_t abort_code = ((uint32_t)msg.data[7] << 24) |
+                                        ((uint32_t)msg.data[6] << 16) |
+                                        ((uint32_t)msg.data[5] << 8)  |
+                                        ((uint32_t)msg.data[4]);
+
+                const char* desc = get_sdoAbortDescription(abort_code);
+                format_time(time_str, sizeof(time_str), msg.timestamp);
+
+                snprintf(node_list[msg.id].error_buf, sizeof(node_list[msg.id].error_buf), "%s", desc);
+                node_list[msg.id].error_desc = node_list[msg.id].error_buf;
+                node_list[msg.id].time_lastError = msg.timestamp;
+
+                char buffer[256];
+                snprintf(buffer, sizeof(buffer),
+                    "Node %d: SDOabort: %-35.35s | %s | %s", msg.id, desc, raw_data, time_str);
+                
+                addCDKSwindow(emWin, buffer, BOTTOM);
+                updated = true;
+                if(node_log_enabled)
                 {
-                    char time_str[16];
-                    char raw_data[64];
-                    #if (CAN_MSG_LEN_FIXED)
-                    snprintf(raw_data, sizeof(raw_data),
-                        "%02X %02X %02X %02X %02X %02X %02X %02X",
-                        msg.data[0], msg.data[1], msg.data[2], msg.data[3],
-                        msg.data[4], msg.data[5], msg.data[6], msg.data[7]);
-                    #else
-                    for (int i = 0; i < msg.len; i++)
-                    {
-                        msg.data[i] = frame.data[i];
-                    }
-                    #endif
-
-                    uint32_t abort_code = ((uint32_t)msg.data[7] << 24) |
-                                          ((uint32_t)msg.data[6] << 16) |
-                                          ((uint32_t)msg.data[5] << 8)  |
-                                          ((uint32_t)msg.data[4]);
-
-                    const char* desc = get_sdoAbortDescription(abort_code);
-                    format_time(time_str, sizeof(time_str), msg.timestamp);
-
-                    snprintf(node_list[msg.id].error_buf, sizeof(node_list[msg.id].error_buf), "%s", desc);
-                    node_list[msg.id].error_desc = node_list[msg.id].error_buf;
-                    node_list[msg.id].time_lastError = msg.timestamp;
-
-                    char buffer[256];
-                    snprintf(buffer, sizeof(buffer),
-                        "Node %d: %-35.35s | %s | %s", msg.id, desc, raw_data, time_str);
-                    
-                    addCDKSwindow(emWin, buffer, BOTTOM);
-                    updated = true;
-                    if(node_log_enabled)
-                    {
-                        fprintf(logfile, "Node %d: %s | %s\n", msg.id, raw_data, time_str);
-                    }
+                    fprintf(logfile, "Node %d: SDOabort: %s | %s\n", msg.id, raw_data, time_str);
                 }
             }
             else
@@ -531,20 +530,10 @@ void* thread_CANopenMonitor(void* arg)
                     char time_str[16];
                     format_time(time_str, sizeof(time_str), msg.timestamp);
 
-                    #if (CAN_MSG_LEN_FIXED)
-                    snprintf(raw_data, sizeof(raw_data),
-                        "%02X %02X %02X %02X %02X %02X %02X %02X",
-                        msg.data[0], msg.data[1], msg.data[2], msg.data[3],
-                        msg.data[4], msg.data[5], msg.data[6], msg.data[7]);
-                    #else
-                    for (int i = 0; i < msg.len; i++)
-                    {
-                        msg.data[i] = frame.data[i];
-                    }
-                    #endif
+                    bytes_to_hex(raw_data, msg.data, msg.len);
 
                     snprintf(buffer, sizeof(buffer),
-                        "Node %d: %-35.35s | %s",
+                        "Node %d: DATA: %-35.35s | %s",
                         msg.id,
                         raw_data,
                         time_str);
@@ -553,7 +542,7 @@ void* thread_CANopenMonitor(void* arg)
                     updated = true;
                     if(node_log_enabled)
                     {
-                        fprintf(logfile, "Node %d: %s | %s\n", msg.id, raw_data, time_str);
+                        fprintf(logfile, "Node %d: DATA: %s | %s\n", msg.id, raw_data, time_str);
                     }
                 }
             }
