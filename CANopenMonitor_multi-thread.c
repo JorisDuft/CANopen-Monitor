@@ -420,7 +420,7 @@ void* thread_gui(void* arg)
         }
     }
 
-    // GUI INIT
+    // TUI INIT
     const char* state_color;
     const char* emcy_color;
     WINDOW *cursesWin = initscr();
@@ -506,6 +506,7 @@ void* thread_gui(void* arg)
                     "%02X %02X %02X %02X %02X %02X %02X %02X",
                     msg.data[0], msg.data[1], msg.data[2], msg.data[3],
                     msg.data[4], msg.data[5], msg.data[6], msg.data[7]);
+
 
                 format_time(time_str, sizeof(time_str), msg.timestamp);
                 
