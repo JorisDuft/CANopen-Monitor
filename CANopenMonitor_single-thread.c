@@ -106,19 +106,6 @@ const char* get_nodeStatus(uint8_t state) {
     }
 }
 
-const char* get_msgCOBtext(uint8_t cob)
-{
-    switch (cob)
-    {
-        case 0x0: return "NMT  :";
-        case 0x1: return "EMCY :";
-        case 0x3 ... 0xA: return "PDO  :";
-        case 0xB ... 0xC: return "SDO  :";
-        case 0xE: return "HB   :";
-        default: return "Other:";
-    }
-}
-
 /*-------------------------------------------------------------------------------
  * Function: get_emergencyErrorDescription
  * ------------------------------------------------------------------------------
@@ -278,6 +265,26 @@ void parse_object_filter(thread_args_t* cfg, char* value)
     if (strcasestr(value, "nmt")) cfg->object_mask |= OBJ_NMT;
 }
 
+void bytes_to_hex(char *raw_data, const uint8_t *data, uint8_t len)
+{
+    static const char hex[] = "0123456789ABCDEF";
+
+    char *ptr = raw_data;
+
+    for (uint8_t i = 0; i < len; i++)
+    {
+        uint8_t b = data[i];
+
+        *ptr++ = hex[b >> 4];
+        *ptr++ = hex[b & 0x0F];
+
+        if (i < len - 1)
+            *ptr++ = ' ';
+    }
+
+    *ptr = '\0';
+}
+
 /*-------------------------------------------------------------------------------
  * Function: load_config
  * ------------------------------------------------------------------------------
@@ -355,27 +362,191 @@ void* thread_CANopenMonitor(void* arg)
     CANNode node_list[128] = {0};
     static time_t time_last_update = 0;
 
-    // CAN SOCKET INIT
     int s;
     struct sockaddr_can addr;
     struct ifreq ifr;
     struct can_frame frame;
 
+    struct can_filter filters[512];
+    int filter_count = 0;
+
     s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if (s < 0) { perror("[CAN Thread] socket failed"); return NULL; }
+
+    if (s < 0)
+    {
+        perror("[CAN Thread] socket failed");
+        return NULL;
+    }
+
+    // NONBLOCKING SOCKET
+    fcntl(s, F_SETFL, O_NONBLOCK);
 
     strcpy(ifr.ifr_name, CAN_INTERFACE);
-    if (ioctl(s, SIOCGIFINDEX, &ifr) < 0) { perror("[CAN Thread] ioctl failed"); return NULL; }
 
-    addr.can_family = AF_CAN;
-    addr.can_ifindex = ifr.ifr_ifindex;
-    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("[CAN Thread] bind failed"); return NULL; }
-
-    int  rcbuf_size = 1024 * 1024 * 4; // 4 MB
-
-    if(setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcbuf_size, sizeof(rcbuf_size)) < 0) {
-        perror("[CAN Thread] setsockopt failed");
+    if (ioctl(s, SIOCGIFINDEX, &ifr) < 0)
+    {
+        perror("[CAN Thread] ioctl failed");
         return NULL;
+    }
+
+    addr.can_family  = AF_CAN;
+    addr.can_ifindex = ifr.ifr_ifindex;
+
+    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        perror("[CAN Thread] bind failed");
+        return NULL;
+    }
+
+    int rcbuf_size = 1024 * 1024 * 64; // 64 MB
+
+    if (setsockopt(s,
+                   SOL_SOCKET,
+                   SO_RCVBUF,
+                   &rcbuf_size,
+                   sizeof(rcbuf_size)) < 0)
+    {
+        perror("[CAN Thread] SO_RCVBUF failed");
+    }
+
+    // EMCY 0x080 - 0x0FF
+    filters[filter_count].can_id   = 0x080;
+    filters[filter_count].can_mask = 0x780;
+    filter_count++;
+
+    // Heartbeat 0x700 - 0x77F
+    filters[filter_count].can_id   = 0x700;
+    filters[filter_count].can_mask = 0x780;
+    filter_count++;
+
+    // ALL SDO TX (contains SDO abort responses)
+    // 0x580 - 0x5FF
+    filters[filter_count].can_id   = 0x580;
+    filters[filter_count].can_mask = 0x780;
+    filter_count++;
+
+    // only node filter active
+    if (node_filter_enabled && !object_filter_enabled)
+    {
+        static const int cob_bases[] =
+        {
+            0x180, // TPDO1
+            0x200, // RPDO1
+            0x280, // TPDO2
+            0x300, // RPDO2
+            0x380, // TPDO3
+            0x400, // RPDO3
+            0x480, // TPDO4
+            0x500, // RPDO4
+            0x600  // SDO RX
+        };
+
+        for (int n = 0; n < node_filter_count; n++)
+        {
+            int node = node_filter_arr[n];
+
+            for (int i = 0;
+                 i < (int)(sizeof(cob_bases) / sizeof(cob_bases[0]));
+                 i++)
+            {
+                filters[filter_count].can_id   = cob_bases[i] + node;
+                filters[filter_count].can_mask = 0x7FF;
+
+                filter_count++;
+            }
+        }
+    }
+
+    // only object filter active
+    else if (!node_filter_enabled && object_filter_enabled)
+    {
+        // NMT
+        if (object_mask & OBJ_NMT)
+        {
+            // NMT 0x000
+            filters[filter_count].can_id   = 0x000;
+            filters[filter_count].can_mask = 0x7FF;
+            filter_count++;
+        }
+
+        // PDO
+        if (object_mask & OBJ_PDO)
+        {
+            for (int base = 0x180;
+                 base <= 0x500;
+                 base += 0x80)
+            {
+                filters[filter_count].can_id   = base;
+                filters[filter_count].can_mask = 0x780;
+
+                filter_count++;
+            }
+        }
+
+        // SDO RX
+        if (object_mask & OBJ_SDO)
+        {
+            filters[filter_count].can_id   = 0x600;
+            filters[filter_count].can_mask = 0x780;
+
+            filter_count++;
+        }
+    }
+    
+    // both filters active
+    else if (node_filter_enabled && object_filter_enabled)
+    {
+        for (int n = 0; n < node_filter_count; n++)
+        {
+            int node = node_filter_arr[n];
+
+            // NMT
+            if (object_mask & OBJ_NMT)
+            {
+                filters[filter_count].can_id   = node;
+                filters[filter_count].can_mask = 0x7FF;
+
+                filter_count++;
+            }
+
+            // PDO
+            if (object_mask & OBJ_PDO)
+            {
+                for (int base = 0x180;
+                     base <= 0x500;
+                     base += 0x80)
+                {
+                    filters[filter_count].can_id   = base + node;
+                    filters[filter_count].can_mask = 0x7FF;
+
+                    filter_count++;
+                }
+            }
+
+            // SDO RX
+            if (object_mask & OBJ_SDO)
+            {
+                filters[filter_count].can_id   = 0x600 + node;
+                filters[filter_count].can_mask = 0x7FF;
+
+                filter_count++;
+            }
+        }
+    }
+
+    // apply filters
+    if (filter_count > 0)
+    {
+        if (setsockopt(s,
+                       SOL_CAN_RAW,
+                       CAN_RAW_FILTER,
+                       filters,
+                       sizeof(struct can_filter) * filter_count) < 0)
+        {
+            perror("[CAN Thread] CAN_RAW_FILTER failed");
+            return NULL;
+        }
+
     }
 
     // Log init
@@ -383,25 +554,22 @@ void* thread_CANopenMonitor(void* arg)
     if(node_log_enabled)
     {
         char filename[128];
-        //char time_str[16];
         time_t time_now = time(NULL);
-        struct tm *t = localtime(&time_now); 
-        t->tm_hour = t->tm_hour + 2;
-        //format_time(time_str, sizeof(time_str), get_time_ms());
-
+        struct tm *t = localtime(&time_now);
+        t->tm_hour = t->tm_hour + 2; // Adjust for timezone
+        
         strftime(filename, sizeof(filename),
             "CANopen_log_%Y-%m-%d_%H-%M-%S.txt", t);
 
         logfile = fopen(filename, "a");
         if (!logfile) {
             perror("Fehler beim Öffnen der Logdatei");
-            printf("Logging error File open failed\n");
             exit(1);
         }
     }
 
 
-    // TUI INIT
+    // GUI INIT
     const char* state_color;
     const char* emcy_color;
     WINDOW *cursesWin = initscr();
@@ -411,7 +579,7 @@ void* thread_CANopenMonitor(void* arg)
 
     int width  = COLS - 2;
     int spacer = 2;
-    int hNode = 16;
+    int hNode = 15;
     int hEm   = 12;
     int hData = LINES - hNode - hEm - (spacer * 2) - 5; 
     if (hData < 3) hData = 3;
@@ -434,32 +602,7 @@ void* thread_CANopenMonitor(void* arg)
     {
         updated = false;
 
-        fd_set readfds;
-        struct timeval tv;
-
-        FD_ZERO(&readfds);
-        FD_SET(s, &readfds);
-
-        int n = 0;
-
-        // 10 ms timeout
-        tv.tv_sec = 0;
-        tv.tv_usec = 10000;
-        int ret = select(s + 1, &readfds, NULL, NULL, &tv);
-
-        if (ret > 0 && FD_ISSET(s, &readfds))
-        {
-            n = read(s, &frame, sizeof(frame));
-        }
-        else if (ret == 0)
-        {
-            // timeout 10MS → KEINE CAN Message -> einfach weiter zur nächsten Iteration, um die GUI ggf. zu aktualisieren
-            n = 0;
-        }
-        else
-        {
-            perror("select error");
-        }
+        int n = read(s, &frame, sizeof(frame));
         if (n == -1 && errno != EAGAIN) perror("CAN read error");
         if (n > 0)
         {
@@ -473,8 +616,7 @@ void* thread_CANopenMonitor(void* arg)
             for (int i = 0; i < msg.len; i++)
                 msg.data[i] = frame.data[i];
 
-            // Heartbeat Messages
-            if (msg.cob == 0xE)
+            if (cob_id >= 0x700 && cob_id <= 0x77F) //msg.cob == 0xE)
             {
                 node_list[msg.id].visible = true;
                 node_list[msg.id].active = true;
@@ -483,27 +625,21 @@ void* thread_CANopenMonitor(void* arg)
                 updated = true;
                 if(node_log_enabled)
                 {
-                    const char* p_status_str = get_nodeStatus(msg.data[0]);
                     char time_str[16];
                     format_time(time_str, sizeof(time_str), msg.timestamp);
-                    fprintf(logfile, "Node %03d: HB: %-32.32s | %02X | %s\n", msg.id, p_status_str, msg.data[0], time_str);
+                    fprintf(logfile, "Node %d: HB: %02X | %s\n", msg.id, msg.data[0], time_str);
                 }
             }
-
-            // Emergency Messages
-            else if (msg.cob == 0x1)
+            else if (cob_id >= 0x080 && cob_id <= 0x0FF)   //msg.cob == 0x1)
             {
                 char em_msg[256];
                 char time_str[16];
                 char raw_data[64];
 
-                snprintf(raw_data, sizeof(raw_data),
-                    "%02X %02X %02X %02X %02X %02X %02X %02X",
-                    msg.data[0], msg.data[1], msg.data[2], msg.data[3],
-                    msg.data[4], msg.data[5], msg.data[6], msg.data[7]);
-                
+
                 format_time(time_str, sizeof(time_str), msg.timestamp);
-                
+
+                bytes_to_hex(raw_data, msg.data, msg.len);
                 uint16_t error_code = ((uint16_t)msg.data[1] << 8) | msg.data[0];
                 const char* error_desc = get_emergencyErrorDescription(error_code);
 
@@ -513,88 +649,70 @@ void* thread_CANopenMonitor(void* arg)
                 node_list[msg.id].time_lastError = msg.timestamp;
 
                 snprintf(em_msg, sizeof(em_msg),
-                        "Node %03d: EMCY: %-30.30s | %s | %s",
-                        msg.id, error_desc,raw_data, time_str);
+                        "Node %d: EMCY: %-35.35s | %s | %s",
+                        msg.id,
+                        error_desc,
+                        raw_data,
+                        time_str);
 
                 addCDKSwindow(emWin, em_msg, BOTTOM);
                 updated = true;
                 if(node_log_enabled)
                 {
-                    fprintf(logfile, "%s\n", em_msg);
+                    fprintf(logfile, "Node %d: EMCY: %s | %s\n", msg.id, raw_data, time_str);
                 }
             }
-
-            // SDO Abort Messages
-            else if (msg.cob == 0xB)
+            else if (cob_id >= 0x580 && cob_id <= 0x5FF &&msg.data[0] == 0x80)
             {
-                if (msg.data[0] == 0x80)
+                char time_str[16];
+                char raw_data[64];
+
+                bytes_to_hex(raw_data, msg.data, msg.len);
+                uint32_t abort_code = ((uint32_t)msg.data[7] << 24) |
+                                        ((uint32_t)msg.data[6] << 16) |
+                                        ((uint32_t)msg.data[5] << 8)  |
+                                        ((uint32_t)msg.data[4]);
+
+                const char* desc = get_sdoAbortDescription(abort_code);
+                format_time(time_str, sizeof(time_str), msg.timestamp);
+
+                snprintf(node_list[msg.id].error_buf, sizeof(node_list[msg.id].error_buf), "%s", desc);
+                node_list[msg.id].error_desc = node_list[msg.id].error_buf;
+                node_list[msg.id].time_lastError = msg.timestamp;
+
+                char buffer[256];
+                snprintf(buffer, sizeof(buffer),
+                    "Node %d: SDOabort: %-35.35s | %s | %s", msg.id, desc, raw_data, time_str);
+                
+                addCDKSwindow(emWin, buffer, BOTTOM);
+                updated = true;
+                if(node_log_enabled)
                 {
-                    char buffer[256];
-                    char time_str[16];
-                    char raw_data[64];
-
-                    snprintf(raw_data, sizeof(raw_data),
-                        "%02X %02X %02X %02X %02X %02X %02X %02X",
-                        msg.data[0], msg.data[1], msg.data[2], msg.data[3],
-                        msg.data[4], msg.data[5], msg.data[6], msg.data[7]);
-                    
-                    uint32_t abort_code = ((uint32_t)msg.data[7] << 24) |
-                                          ((uint32_t)msg.data[6] << 16) |
-                                          ((uint32_t)msg.data[5] << 8)  |
-                                          ((uint32_t)msg.data[4]);
-
-                    const char* desc = get_sdoAbortDescription(abort_code);
-                    format_time(time_str, sizeof(time_str), msg.timestamp);
-
-                    snprintf(node_list[msg.id].error_buf, sizeof(node_list[msg.id].error_buf), "SDO Abort: %s", desc);
-                    node_list[msg.id].error_desc = node_list[msg.id].error_buf;
-                    node_list[msg.id].time_lastError = msg.timestamp;
-
-                    snprintf(buffer, sizeof(buffer),
-                        "Node %03d: SDO Abort: %-25.25s | %s | %s", 
-                        msg.id, desc, raw_data, time_str);
-                    
-                    addCDKSwindow(emWin, buffer, BOTTOM);
-                    updated = true;
-                    if(node_log_enabled)
-                    {
-                        fprintf(logfile, "%s\n", buffer);
-                    }
+                    fprintf(logfile, "Node %d: SDOabort: %s | %s\n", msg.id, raw_data, time_str);
                 }
             }
             else
-            {    
-                if (!nodeID_filter(msg.id, gui_args) || !commObj_filter(msg.cob, gui_args))    { continue; }
-                else
+            {   
+                char buffer[256];
+                char raw_data[64];
+                char time_str[16];
+                format_time(time_str, sizeof(time_str), msg.timestamp);
+
+                bytes_to_hex(raw_data, msg.data, msg.len);
+
+                snprintf(buffer, sizeof(buffer),
+                    "Node %d: DATA: %-35.35s | %s",
+                    msg.id,
+                    raw_data,
+                    time_str);
+                
+                addCDKSwindow(dataWin, buffer, BOTTOM);
+                updated = true;
+                if(node_log_enabled)
                 {
-                    char buffer[256];
-                    char raw_data[64];
-                    char time_str[16];
-
-                    snprintf(raw_data, sizeof(raw_data),
-                        "%02X %02X %02X %02X %02X %02X %02X %02X",
-                        msg.data[0], msg.data[1], msg.data[2], msg.data[3],
-                        msg.data[4], msg.data[5], msg.data[6], msg.data[7]);
-
-                    format_time(time_str, sizeof(time_str), msg.timestamp);
-
-                    snprintf(buffer, sizeof(buffer),
-                        "Node %03d: %s %-29.29s | %s",
-                        msg.id, get_msgCOBtext(msg.cob), raw_data, time_str);
-                    
-                    addCDKSwindow(dataWin, buffer, BOTTOM);
-                    updated = true;
-                    if(node_log_enabled)
-                    {
-                        fprintf(logfile, "%s\n", buffer);
-                    }
+                    fprintf(logfile, "Node %d: DATA: %s | %s\n", msg.id, raw_data, time_str);
                 }
             }
-        }
-
-        if(get_time_ms() - time_last_update > 1000) //minimaler Update-Intervall --> aktualisiert auch die Heartbeat-Statusanzeige, wenn kein neues CAN-Message ankommt
-        {
-            updated = true;
         }
 
         if ((updated || state_changed) && get_time_ms() - time_last_update > GUI_UPDATE_INTERVAL_MS)
@@ -659,12 +777,12 @@ void* thread_CANopenMonitor(void* arg)
                     }
 
                     /* Feste Spaltenbreiten vorbereiten */
-                    snprintf(statebuf, sizeof(statebuf), "%-15.15s", state_name);   
+                    snprintf(statebuf, sizeof(statebuf), "%-15.15s", state_name);
                     snprintf(errorbuf, sizeof(errorbuf), "%-35.35s", error);
 
                     /* Gesamte Tabellenzeile */
                     snprintf(row, sizeof(row),
-                        "%-6.03d | </%s>%s<!%s> | </%s>%s<!%s> | %-10s | %-10s",
+                        "%-6d | </%s>%s<!%s> | </%s>%s<!%s> | %-10s | %-10s",
                         i,
                         state_color, statebuf, state_color,
                         emcy_color,  errorbuf, emcy_color,
@@ -674,9 +792,9 @@ void* thread_CANopenMonitor(void* arg)
                     addCDKSwindow(nodeWin, row, BOTTOM);
                 }
             }
-            drawCDKSwindow(nodeWin, TRUE);
-            drawCDKSwindow(emWin, TRUE);
-            drawCDKSwindow(dataWin, TRUE);
+            //drawCDKSwindow(nodeWin, TRUE);
+            //drawCDKSwindow(emWin, TRUE);
+            //drawCDKSwindow(dataWin, TRUE);
             refreshCDKScreen(cdkscreen);
             if(node_log_enabled)
             {
@@ -686,18 +804,14 @@ void* thread_CANopenMonitor(void* arg)
             state_changed = false;
         }
 
-        usleep(1000);
+        //usleep(10);
     }
 
     endCDK();
-    if (logfile)
-    {
-        fclose(logfile);
-    }
     return NULL;
 }
 
-int main()  
+int main() 
 {
     thread_args_t gui_args;
     memset(&gui_args, 0, sizeof(gui_args));
